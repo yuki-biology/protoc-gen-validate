@@ -4,6 +4,11 @@ import struct
 import sys
 import time
 import uuid
+import importlib
+import importlib.machinery
+import importlib.util
+import tempfile
+import os
 from functools import lru_cache
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from urllib import parse as urlparse
@@ -57,17 +62,27 @@ def validate(proto_message: Message):
     return _validate_inner(ValidatingMessage(proto_message))(proto_message)
 
 
+def _generate_validate(func: str):
+    tf = tempfile.NamedTemporaryFile("r+")
+    tf.write(func)
+    tf.flush()
+    mod_name = os.path.basename(tf.name)
+    loader = importlib.machinery.SourceFileLoader(mod_name, tf.name)
+    spec = importlib.util.spec_from_file_location(
+        mod_name, tf.name, loader=loader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tf.close()
+    return module.generate_validate
+
+
 # Cache generated functions with the message descriptor's full_name as the cache key
 @lru_cache()
 def _validate_inner(proto_message: Message):
     func = file_template(proto_message)
     global printer
     printer += func + "\n"
-    exec(func)
-    try:
-        return generate_validate
-    except NameError:
-        return locals()['generate_validate']
+    return _generate_validate(func)
 
 
 class ChangeFuncName(ast.NodeTransformer):
@@ -214,11 +229,7 @@ def _validate_all_inner(proto_message: Message):
     func = comment + " All" + "\n" + func
     global printer
     printer += func + "\n"
-    exec(func)
-    try:
-        return generate_validate_all
-    except NameError:
-        return locals()['generate_validate_all']
+    return _generate_validate(func)
 
 
 def _validate_all(proto_message: Message) -> str:
