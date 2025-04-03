@@ -1,14 +1,12 @@
 import ast
+import importlib
+import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import uuid
-import importlib
-import importlib.machinery
-import importlib.util
-import tempfile
-import os
 from functools import lru_cache
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from urllib import parse as urlparse
