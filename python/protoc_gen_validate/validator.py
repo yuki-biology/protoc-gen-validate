@@ -1,7 +1,10 @@
 import ast
+import importlib
+import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import uuid
 from functools import lru_cache
@@ -57,17 +60,26 @@ def validate(proto_message: Message):
     return _validate_inner(ValidatingMessage(proto_message))(proto_message)
 
 
+def _generate_validate(func: str, key: str = "generate_validate") -> callable:
+    tf = tempfile.NamedTemporaryFile("r+")
+    tf.write(func)
+    tf.flush()
+    mod_name = os.path.basename(tf.name)
+    loader = importlib.machinery.SourceFileLoader(mod_name, tf.name)
+    spec = importlib.util.spec_from_file_location(mod_name, tf.name, loader=loader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tf.close()
+    return getattr(module, key)
+
+
 # Cache generated functions with the message descriptor's full_name as the cache key
 @lru_cache()
 def _validate_inner(proto_message: Message):
     func = file_template(proto_message)
     global printer
     printer += func + "\n"
-    exec(func)
-    try:
-        return generate_validate
-    except NameError:
-        return locals()['generate_validate']
+    return _generate_validate(func, key="generate_validate")
 
 
 class ChangeFuncName(ast.NodeTransformer):
@@ -214,11 +226,7 @@ def _validate_all_inner(proto_message: Message):
     func = comment + " All" + "\n" + func
     global printer
     printer += func + "\n"
-    exec(func)
-    try:
-        return generate_validate_all
-    except NameError:
-        return locals()['generate_validate_all']
+    return _generate_validate(func, "generate_validate_all")
 
 
 def _validate_all(proto_message: Message) -> str:
@@ -854,7 +862,7 @@ def enum_in_template(value, name, field):
     {%- endif -%}
     {%- if value['not_in'] %}
     if {{ name }} in {{ value['not_in'] }}:
-        raise ValidationFailed(\"{{ name }} in {{ enum_names(field, value['not_in']) }}\")
+        raise ValidationFailed(\"{{ name }} in {{ value['not_in'] }}\")
     {%- endif -%}
     """
     return Template(in_tmpl).render(value=value, name=name, field=field, enum_names=enum_names)
@@ -938,7 +946,6 @@ def bytes_template(option_value, name):
         IPv6Address({{ name }})
     except ValueError:
         raise ValidationFailed(\"{{ name }} is not a valid ipv6\")
-    {%- endif -%}
     {% if b['pattern'] %}
         {% if sys.version_info[0] >= 3%}
     if re.search({{ b['pattern'].encode('unicode-escape') }}, {{ name }}) is None:
@@ -972,7 +979,7 @@ def bytes_template(option_value, name):
         raise ValidationFailed(\"{{ name }} does not end with suffix {{ b['suffix'] }}\")
         {% else %}
     if not {{name}}.endswith(b\"{{ b['suffix'].encode('string_escape') }}\"):
-        raise ValidationFailed(\"{{ name }} does not end with suffix {{ b['suffix'] }}\")
+        raise ValidationFailed(\"{{ name }} does not end with suffix {{ b['suffix'].encode('string_escape') }}\")
         {% endif %}
     {% endif %}
     {% endfilter %}
@@ -1222,34 +1229,44 @@ def rule_type(field):
 
 
 def file_template(proto_message):
-    file_tmp = """
-# Validates {{ p.DESCRIPTOR.name }}
+    import os
+    # このファイル（validator.py）の絶対パスから1つ上のディレクトリ（python/）を取得
+    project_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    file_tmp = """#!/bin/python3
+# isort: skip_file
+import os
+import re
+import sys
+if {PROJECT_DIR} not in sys.path:
+    sys.path.insert(0, {PROJECT_DIR})
+from protoc_gen_validate.validator import *
+
 def generate_validate(p):
     {%- for option_descriptor, option_value in p.DESCRIPTOR.GetOptions().ListFields() %}
-        {%- if option_descriptor.full_name == "validate.disabled" and option_value %}
+    {%- if option_descriptor.full_name == "validate.disabled" and option_value %}
     return None
-        {%- elif option_descriptor.full_name == "validate.ignored" and option_value %}
+    {%- elif option_descriptor.full_name == "validate.ignored" and option_value %}
     return None
-        {%- endif -%}
-    {%- endfor -%}
+    {%- endif %}
+    {%- endfor %}
     {%- for oneof in p.DESCRIPTOR.oneofs %}
     present = False
         {%- for field in oneof.fields %}
-    if _has_field(p, \"{{ field.name }}\"):
+    if _has_field(p, "{{ field.name }}"):
         present = True
-        {{ rule_type(field)|indent(4,True) }}
+        {{ rule_type(field)|indent(8) }}
         {%- endfor %}
-        {% for option in oneof.GetOptions().ListFields() %}
-        {% if option[0].name == 'required' and option[1] %}
+        {%- for option in oneof.GetOptions().ListFields() %}
+        {%- if option[0].name == 'required' and option[1] %}
     if not present:
-        raise ValidationFailed(\"Oneof {{ oneof.name }} is required\")
-        {% endif %}
-        {% endfor %}
-    {%- endfor %}
-    {%- for field in p.DESCRIPTOR.fields -%}
-        {%- if not field.containing_oneof %}
-    {{ rule_type(field) -}}
+        raise ValidationFailed("Oneof {{ oneof.name }} is required")
         {%- endif %}
+        {%- endfor %}
     {%- endfor %}
-    return None"""
+    {%- for field in p.DESCRIPTOR.fields if not field.containing_oneof %}
+    {{ rule_type(field) }}
+    {%- endfor %}
+    return None
+"""
+    file_tmp = file_tmp.replace("{PROJECT_DIR}", repr(project_dir))
     return Template(file_tmp).render(rule_type=rule_type, p=proto_message)
